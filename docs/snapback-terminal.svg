@@ -1,0 +1,49 @@
+<svg width="1100" height="680" viewBox="0 0 1100 680" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Snapback terminal preview</title>
+  <rect width="1100" height="680" rx="18" fill="#0B1020"/>
+  <rect x="34" y="34" width="1032" height="612" rx="14" fill="#111827" stroke="#263244"/>
+  <circle cx="70" cy="68" r="8" fill="#F87171"/>
+  <circle cx="98" cy="68" r="8" fill="#FBBF24"/>
+  <circle cx="126" cy="68" r="8" fill="#34D399"/>
+  <text x="550" y="74" fill="#94A3B8" font-family="SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="18" text-anchor="middle">snapback demo</text>
+
+  <text x="70" y="130" fill="#6EE7B7" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">$</text>
+  <text x="100" y="130" fill="#E5E7EB" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    python3 snapback.py backup --src ~/Projects --dest /Backup/snapback
+  </text>
+  <text x="100" y="178" fill="#CBD5E1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    Snapshot 2026-05-12_21-44-08
+  </text>
+  <text x="100" y="218" fill="#CBD5E1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    added/changed : 42
+  </text>
+  <text x="100" y="258" fill="#CBD5E1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    deleted marks : 3
+  </text>
+  <text x="100" y="298" fill="#CBD5E1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    zip size      : 184.6 KB
+  </text>
+
+  <text x="70" y="372" fill="#6EE7B7" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">$</text>
+  <text x="100" y="372" fill="#E5E7EB" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    python3 snapback.py list --project myapp --dest /Backup/snapback
+  </text>
+  <text x="100" y="420" fill="#CBD5E1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    Snapshots for 'myapp':
+  </text>
+  <text x="100" y="460" fill="#CBD5E1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    2026-05-12_21-44-08  +42 -3
+  </text>
+
+  <text x="70" y="530" fill="#6EE7B7" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">$</text>
+  <text x="100" y="530" fill="#E5E7EB" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    python3 snapback.py restore --project myapp --date 2026-05-12 \
+  </text>
+  <text x="100" y="570" fill="#E5E7EB" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    --file src/main.py --dest /Backup/snapback --out ./restored
+  </text>
+  <text x="100" y="618" fill="#CBD5E1" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="24">
+    Restored 1 file(s) -&gt; ./restored
+  </text>
+</svg>

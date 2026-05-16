@@ -1,0 +1,42 @@
+# snapback.ignore
+#
+# Patterns for directories and extensions to skip during backup.
+# One entry per line. Lines starting with # are comments.
+# Put this file next to snapback.py or in --dest root.
+
+# ── Directories (exact name match at any depth) ──
+node_modules
+.venv
+venv
+env
+.env
+__pycache__
+.git
+.idea
+.vscode
+.mypy_cache
+.pytest_cache
+.tox
+.eggs
+dist
+build
+.next
+.nuxt
+.output
+.turbo
+target
+Pods
+.gradle
+.DS_Store
+.cache
+.parcel-cache
+coverage
+
+# ── File extensions ──
+*.pyc
+*.pyo
+*.o
+*.so
+*.dylib
+*.dll
+*.class
