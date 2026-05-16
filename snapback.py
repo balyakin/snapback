@@ -1,89 +1,195 @@
 #!/usr/bin/env python3
-"""
-snapback — incremental project backup with per-file deduplication.
-
-Usage:
-    snapback backup  --src ~/Projects --dest /Volumes/Backup/snapback
-    snapback list                      --dest /Volumes/Backup/snapback
-    snapback list    --project myapp   --dest /Volumes/Backup/snapback
-    snapback show    --project myapp --date 2026-05-12  --dest /Volumes/Backup/snapback
-    snapback restore --project myapp --date 2026-05-12  --dest /Volumes/Backup/snapback --out ./restored
-    snapback restore --project myapp --date 2026-05-12 --file src/main.py --dest /Volumes/Backup/snapback --out ./restored
-"""
+"""snapback - incremental project backup with per-file deduplication"""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import os
+import shutil
 import sqlite3
 import sys
-import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
-# ── Default ignore patterns ─────────────────────────────────────────────────
-IGNORE_DIRS = {
-    "node_modules", ".venv", "venv", "__pycache__", ".git", ".idea",
-    ".vscode", ".mypy_cache", ".pytest_cache", ".tox", ".eggs",
-    "dist", "build", ".next", ".nuxt", ".output", ".turbo",
-    "target",          # Rust / Java
-    "Pods",            # iOS CocoaPods
+IGNORE_FILE_NAME = "snapback.ignore"
+DB_NAME = "snapback.db"
+SNAPSHOT_DIR_NAME = "snapshots"
+SNAPSHOT_ZIP_NAME = "data.zip"
+SNAPSHOT_DATE_FORMAT = "%Y-%m-%d_%H-%M-%S"
+ZIP_COMPRESSION_LEVEL = 6
+HASH_BUFFER_SIZE = 1 << 16
+
+DEFAULT_IGNORE_NAMES = {
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".git",
+    ".idea",
+    ".vscode",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    ".eggs",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".turbo",
+    "target",
+    "Pods",
     ".gradle",
     ".DS_Store",
-    "env", ".env",
+    "env",
+    ".env",
 }
 
-IGNORE_EXTENSIONS = {
-    ".pyc", ".pyo", ".o", ".so", ".dylib", ".dll", ".class",
+DEFAULT_IGNORE_EXTENSIONS = {
+    ".pyc",
+    ".pyo",
+    ".o",
+    ".so",
+    ".dylib",
+    ".dll",
+    ".class",
 }
 
-DB_NAME = "snapback.db"
+
+class _BackupReadError(Exception):
+    pass
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def sha256_file(path: Path, buf_size: int = 1 << 16) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(buf_size):
-            h.update(chunk)
-    return h.hexdigest()
+class _FileState(NamedTuple):
+    project: str
+    rel_path: str
+    sha256: str
+    size: int
+    deleted: int
 
 
-def should_ignore(path: Path) -> bool:
-    parts = path.parts
-    for part in parts:
-        if part in IGNORE_DIRS:
+class _NewBlob(NamedTuple):
+    sha256: str
+    source_path: Path
+    zip_key: str
+
+
+class _BackupPlan(NamedTuple):
+    file_states: List[_FileState]
+    new_blobs: List[_NewBlob]
+    files_added: int
+    files_deleted: int
+
+
+class _SnapshotPaths(NamedTuple):
+    snapshot_name: str
+    snapshot_dir: Path
+    zip_path: Path
+
+
+def sha256_file(path: Path, buf_size: int = HASH_BUFFER_SIZE) -> str:
+    """Calculate SHA-256 for a file
+
+    Args:
+        path: File path.
+        buf_size: Read buffer size.
+
+    Returns:
+        Hex encoded SHA-256 digest.
+
+    Raises:
+        OSError: If the file cannot be read
+    """
+    digest = hashlib.sha256()
+
+    with open(str(path), "rb") as source_file:
+        chunk = source_file.read(buf_size)
+        while chunk:
+            digest.update(chunk)
+            chunk = source_file.read(buf_size)
+
+    return digest.hexdigest()
+
+
+def should_ignore(path: Path, ignore_names: Set[str], ignore_extensions: Set[str]) -> bool:
+    """Check whether a relative path must be ignored
+
+    Args:
+        path: Relative path inside a project.
+        ignore_names: Ignored file or directory names.
+        ignore_extensions: Ignored file suffixes.
+
+    Returns:
+        True when the path should be skipped, otherwise False
+    """
+    for path_part in path.parts:
+        if path_part in ignore_names:
             return True
-    if path.suffix in IGNORE_EXTENSIONS:
-        return True
+
+    for extension in ignore_extensions:
+        if path.name.endswith(extension):
+            return True
+
     return False
 
 
-def scan_project(project_root: Path) -> dict[str, tuple[str, int]]:
-    """Return {relative_path: (sha256, size)} for every tracked file."""
-    files: dict[str, tuple[str, int]] = {}
-    for dirpath, dirnames, filenames in os.walk(project_root):
-        # prune ignored dirs in-place so os.walk skips them
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-        for fname in filenames:
-            full = Path(dirpath) / fname
-            rel = full.relative_to(project_root)
-            if should_ignore(rel):
+def scan_project(
+    project_root: Path,
+    ignore_names: Set[str],
+    ignore_extensions: Set[str],
+) -> Dict[str, Tuple[str, int]]:
+    """Scan a project and return current file hashes
+
+    Args:
+        project_root: Project directory.
+        ignore_names: Ignored file or directory names.
+        ignore_extensions: Ignored file suffixes.
+
+    Returns:
+        Mapping from relative path to SHA-256 and file size.
+
+    Raises:
+        _BackupReadError: If any project file cannot be read
+    """
+    files: Dict[str, Tuple[str, int]] = {}
+
+    for dirpath, dirnames, filenames in os.walk(str(project_root)):
+        dirnames[:] = sorted(
+            dirname for dirname in dirnames
+            if dirname not in ignore_names
+        )
+
+        for file_name in sorted(filenames):
+            file_path = Path(dirpath) / file_name
+            rel_path = file_path.relative_to(project_root)
+
+            if should_ignore(rel_path, ignore_names, ignore_extensions):
                 continue
+
             try:
-                h = sha256_file(full)
-                sz = full.stat().st_size
-                files[str(rel)] = (h, sz)
-            except (PermissionError, OSError):
-                pass
+                file_hash = sha256_file(file_path)
+                file_size = file_path.stat().st_size
+            except OSError as error:
+                message = "Cannot read file during backup: {}".format(file_path)
+                raise _BackupReadError(message) from error
+
+            files[str(rel_path)] = (file_hash, file_size)
+
     return files
 
 
 def init_db(db_path: Path) -> sqlite3.Connection:
+    """Initialize the SQLite database
+
+    Args:
+        db_path: SQLite database path.
+
+    Returns:
+        Open SQLite connection
+    """
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -108,201 +214,157 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             ON file_states(project, rel_path, snapshot_id DESC);
         CREATE INDEX IF NOT EXISTS idx_fs_snap
             ON file_states(snapshot_id);
-
-        -- blob dedup: maps sha256 → first zip that stored it
         CREATE TABLE IF NOT EXISTS blobs (
             sha256   TEXT PRIMARY KEY,
             zip_path TEXT NOT NULL,
-            zip_key  TEXT NOT NULL       -- entry name inside the zip
+            zip_key  TEXT NOT NULL
         );
     """)
     conn.commit()
     return conn
 
 
-# ── Backup ───────────────────────────────────────────────────────────────────
-
 def do_backup(src: Path, dest: Path) -> None:
-    if not src.is_dir():
-        sys.exit(f"Source directory not found: {src}")
-    dest.mkdir(parents=True, exist_ok=True)
+    """Create a new backup snapshot
 
-    db_path = dest / DB_NAME
-    conn = init_db(db_path)
-    cur = conn.cursor()
+    Args:
+        src: Root directory that contains project directories.
+        dest: Backup destination directory.
 
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # ensure unique dir even if called multiple times per second
-    snap_dir = dest / "snapshots" / ts
-    suffix = 0
-    while snap_dir.exists():
-        suffix += 1
-        snap_dir = dest / "snapshots" / f"{ts}_{suffix}"
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = snap_dir / "data.zip"
+    Returns:
+        None
+    """
+    source_path = src.expanduser()
+    destination_path = dest.expanduser()
 
-    # discover projects (top-level dirs in src)
-    projects = sorted(
-        p for p in src.iterdir()
-        if p.is_dir() and not p.name.startswith(".")
-    )
+    if not source_path.is_dir():
+        sys.exit("Source directory not found: {}".format(source_path))
 
-    total_added = 0
-    total_deleted = 0
+    source_path = source_path.resolve()
+    destination_path = destination_path.resolve()
 
-    zf = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6)
+    if _is_relative_to(destination_path, source_path):
+        sys.exit("Backup destination must not be inside the source directory: {}".format(destination_path))
 
-    for proj_dir in projects:
-        project = proj_dir.name
-        current = scan_project(proj_dir)
+    destination_path.mkdir(parents=True, exist_ok=True)
 
-        # last known state for this project
-        prev: dict[str, str] = {}  # rel_path → sha256
-        rows = cur.execute("""
-            SELECT fs.rel_path, fs.sha256, fs.deleted
-            FROM file_states fs
-            WHERE fs.project = ?
-              AND fs.snapshot_id = (
-                  SELECT MAX(fs2.snapshot_id)
-                  FROM file_states fs2
-                  WHERE fs2.project = fs.project
-                    AND fs2.rel_path = fs.rel_path
-              )
-        """, (project,)).fetchall()
-        for rp, h, deleted in rows:
-            if not deleted:
-                prev[rp] = h
+    conn = init_db(destination_path / DB_NAME)
+    try:
+        ignore_rules = _load_ignore_rules(destination_path)
+        backup_plan = _build_backup_plan(source_path, conn.cursor(), ignore_rules)
 
-        # ── new / changed files ──
-        need_store: list[tuple[str, str, int]] = []  # (rel_path, sha256, size)
-        for rp, (h, sz) in current.items():
-            if rp not in prev or prev[rp] != h:
-                need_store.append((rp, h, sz))
+        if backup_plan.files_added == 0 and backup_plan.files_deleted == 0:
+            _write_line("Nothing changed since last backup.")
+            return
 
-        # ── deleted files ──
-        deleted_paths = set(prev.keys()) - set(current.keys())
+        snapshot_paths = _create_snapshot_paths(destination_path)
 
-        if not need_store and not deleted_paths:
-            continue  # project unchanged
+        try:
+            _write_new_blobs(backup_plan.new_blobs, snapshot_paths.zip_path)
+            _save_snapshot(conn.cursor(), snapshot_paths, backup_plan)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            _remove_snapshot_dir(snapshot_paths.snapshot_dir)
+            raise
 
-        # placeholder snapshot id — we'll update later
-        # first, store blobs
-        for rp, h, sz in need_store:
-            blob_row = cur.execute(
-                "SELECT zip_path, zip_key FROM blobs WHERE sha256 = ?", (h,)
-            ).fetchone()
-            if blob_row is None:
-                # store in this zip
-                zip_key = f"{project}/{rp}"
-                zf.write(str(proj_dir / rp), zip_key)
-                cur.execute(
-                    "INSERT INTO blobs(sha256, zip_path, zip_key) VALUES (?,?,?)",
-                    (h, str(zip_path), zip_key),
-                )
+        zip_size = snapshot_paths.zip_path.stat().st_size
+        zip_size_kb = zip_size / 1024
 
-        total_added += len(need_store)
-        total_deleted += len(deleted_paths)
-
-        # we'll write file_states after we have the snapshot id
-        # stash them
-        if not hasattr(do_backup, "_pending"):
-            do_backup._pending = []  # type: ignore[attr-defined]
-        for rp, h, sz in need_store:
-            do_backup._pending.append((project, rp, h, sz, 0))  # type: ignore[attr-defined]
-        for rp in deleted_paths:
-            do_backup._pending.append((project, rp, prev[rp], 0, 1))  # type: ignore[attr-defined]
-
-    zf.close()
-
-    if total_added == 0 and total_deleted == 0:
-        # nothing changed — remove empty snapshot
-        zip_path.unlink(missing_ok=True)
-        snap_dir.rmdir()
-        print("Nothing changed since last backup.")
+        _write_line("Snapshot {}".format(snapshot_paths.snapshot_name))
+        _write_line("  added/changed : {}".format(backup_plan.files_added))
+        _write_line("  deleted marks : {}".format(backup_plan.files_deleted))
+        _write_line("  zip size      : {:.1f} KB".format(zip_size_kb))
+    except _BackupReadError as error:
+        conn.rollback()
+        sys.exit(str(error))
+    finally:
         conn.close()
-        return
 
-    cur.execute(
-        "INSERT INTO snapshots(timestamp, zip_path, files_added, files_del) VALUES (?,?,?,?)",
-        (ts, str(zip_path), total_added, total_deleted),
-    )
-    snap_id = cur.lastrowid
-
-    for project, rp, h, sz, deleted in do_backup._pending:  # type: ignore[attr-defined]
-        cur.execute(
-            "INSERT INTO file_states(snapshot_id, project, rel_path, sha256, size, deleted) VALUES (?,?,?,?,?,?)",
-            (snap_id, project, rp, h, sz, deleted),
-        )
-    do_backup._pending = []  # type: ignore[attr-defined]
-
-    conn.commit()
-    conn.close()
-
-    zip_size = zip_path.stat().st_size
-    print(f"Snapshot {ts}")
-    print(f"  added/changed : {total_added}")
-    print(f"  deleted marks : {total_deleted}")
-    print(f"  zip size      : {zip_size / 1024:.1f} KB")
-
-
-# ── List snapshots / projects ────────────────────────────────────────────────
 
 def do_list(dest: Path, project: Optional[str]) -> None:
-    conn = init_db(dest / DB_NAME)
+    """List backed up projects or snapshots
+
+    Args:
+        dest: Backup destination directory.
+        project: Optional project name.
+
+    Returns:
+        None
+    """
+    conn = init_db(dest.expanduser() / DB_NAME)
     cur = conn.cursor()
 
-    if project is None:
-        # list all projects + snapshot count
-        rows = cur.execute("""
-            SELECT DISTINCT project FROM file_states ORDER BY project
-        """).fetchall()
-        if not rows:
-            print("No backups yet.")
+    try:
+        if project is None:
+            rows = cur.execute("""
+                SELECT DISTINCT project FROM file_states ORDER BY project
+            """).fetchall()
+
+            if not rows:
+                _write_line("No backups yet.")
+                return
+
+            _write_line("Projects:")
+            for row in rows:
+                project_name = row[0]
+                count_row = cur.execute(
+                    "SELECT COUNT(DISTINCT snapshot_id) FROM file_states WHERE project = ?",
+                    (project_name,),
+                ).fetchone()
+                snapshot_count = count_row[0]
+                _write_line("  {}  ({} snapshots)".format(project_name, snapshot_count))
             return
-        print("Projects:")
-        for (p,) in rows:
-            cnt = cur.execute(
-                "SELECT COUNT(DISTINCT snapshot_id) FROM file_states WHERE project=?", (p,)
-            ).fetchone()[0]
-            print(f"  {p}  ({cnt} snapshots)")
-    else:
+
         rows = cur.execute("""
             SELECT s.id, s.timestamp, s.files_added, s.files_del
             FROM snapshots s
-            WHERE s.id IN (SELECT DISTINCT snapshot_id FROM file_states WHERE project=?)
+            WHERE s.id IN (SELECT DISTINCT snapshot_id FROM file_states WHERE project = ?)
             ORDER BY s.timestamp
         """, (project,)).fetchall()
+
         if not rows:
-            print(f"No snapshots for project '{project}'.")
+            _write_line("No snapshots for project '{}'.".format(project))
             return
-        print(f"Snapshots for '{project}':")
-        for sid, ts, added, deleted in rows:
-            print(f"  {ts}  +{added} -{deleted}")
-    conn.close()
 
+        _write_line("Snapshots for '{}':".format(project))
+        for row in rows:
+            timestamp = row[1]
+            files_added = row[2]
+            files_deleted = row[3]
+            _write_line("  {}  +{} -{}".format(timestamp, files_added, files_deleted))
+    finally:
+        conn.close()
 
-# ── Show: list files in a project at a given date ───────────────────────────
 
 def do_show(dest: Path, project: str, date_str: str) -> None:
-    conn = init_db(dest / DB_NAME)
+    """Show files in a project at a date
+
+    Args:
+        dest: Backup destination directory.
+        project: Project name.
+        date_str: Date prefix or full snapshot timestamp.
+
+    Returns:
+        None
+    """
+    conn = init_db(dest.expanduser() / DB_NAME)
     cur = conn.cursor()
 
-    # find latest snapshot ≤ date
-    snap_id = _resolve_snapshot(cur, project, date_str)
-    if snap_id is None:
-        print(f"No snapshot found for '{project}' on or before {date_str}.")
+    try:
+        snapshot_id = _resolve_snapshot(cur, project, date_str)
+        if snapshot_id is None:
+            _write_line("No snapshot found for '{}' on or before {}.".format(project, date_str))
+            return
+
+        files = _reconstruct_tree(cur, project, snapshot_id)
+        _write_line("Files in '{}' as of snapshot <= {}  ({} files):".format(project, date_str, len(files)))
+
+        for rel_path in sorted(files):
+            _write_line("  {}".format(rel_path))
+    finally:
         conn.close()
-        return
 
-    # reconstruct file tree at that snapshot
-    files = _reconstruct_tree(cur, project, snap_id)
-    print(f"Files in '{project}' as of snapshot ≤ {date_str}  ({len(files)} files):")
-    for rp in sorted(files):
-        print(f"  {rp}")
-    conn.close()
-
-
-# ── Restore ──────────────────────────────────────────────────────────────────
 
 def do_restore(
     dest: Path,
@@ -311,125 +373,398 @@ def do_restore(
     out: Path,
     single_file: Optional[str],
 ) -> None:
-    conn = init_db(dest / DB_NAME)
+    """Restore a project or a single file from a snapshot
+
+    Args:
+        dest: Backup destination directory.
+        project: Project name.
+        date_str: Date prefix or full snapshot timestamp.
+        out: Output directory.
+        single_file: Optional relative file path to restore.
+
+    Returns:
+        None
+    """
+    conn = init_db(dest.expanduser() / DB_NAME)
     cur = conn.cursor()
 
-    snap_id = _resolve_snapshot(cur, project, date_str)
-    if snap_id is None:
-        sys.exit(f"No snapshot found for '{project}' on or before {date_str}.")
+    try:
+        snapshot_id = _resolve_snapshot(cur, project, date_str)
+        if snapshot_id is None:
+            sys.exit("No snapshot found for '{}' on or before {}.".format(project, date_str))
 
-    tree = _reconstruct_tree(cur, project, snap_id)
+        tree = _reconstruct_tree(cur, project, snapshot_id)
 
-    if single_file:
-        if single_file not in tree:
-            sys.exit(f"File '{single_file}' not found in project at that date.")
-        tree = {single_file: tree[single_file]}
+        if single_file:
+            if single_file not in tree:
+                sys.exit("File '{}' not found in project at that date.".format(single_file))
 
-    out.mkdir(parents=True, exist_ok=True)
-    restored = 0
+            tree = {single_file: tree[single_file]}
 
-    for rp, sha in tree.items():
-        blob_row = cur.execute(
-            "SELECT zip_path, zip_key FROM blobs WHERE sha256=?", (sha,)
-        ).fetchone()
-        if blob_row is None:
-            print(f"  WARNING: blob missing for {rp} (sha256={sha[:12]}…)")
+        output_path = out.expanduser()
+        output_path.mkdir(parents=True, exist_ok=True)
+        restored_count = 0
+
+        for rel_path in sorted(tree):
+            file_hash = tree[rel_path]
+            blob_row = cur.execute(
+                "SELECT zip_path, zip_key FROM blobs WHERE sha256 = ?",
+                (file_hash,),
+            ).fetchone()
+
+            if blob_row is None:
+                _write_line("  WARNING: blob missing for {} (sha256={})".format(rel_path, file_hash[:12]))
+                continue
+
+            zip_path = blob_row[0]
+            zip_key = blob_row[1]
+            target_path = output_path / rel_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with zipfile.ZipFile(zip_path, "r") as zip_archive:
+                data = zip_archive.read(zip_key)
+
+            target_path.write_bytes(data)
+            restored_count += 1
+
+        _write_line("Restored {} file(s) -> {}".format(restored_count, output_path))
+    finally:
+        conn.close()
+
+
+def main() -> None:
+    """Run the command-line interface
+
+    Returns:
+        None
+    """
+    parser = argparse.ArgumentParser(
+        prog="snapback",
+        description="Incremental project backups with per-file dedup into zip archives.",
+    )
+    subparsers = parser.add_subparsers(dest="cmd")
+
+    backup_parser = subparsers.add_parser("backup", help="Create a new snapshot")
+    backup_parser.add_argument("--src", required=True, type=Path, help="Root directory with projects")
+    backup_parser.add_argument("--dest", required=True, type=Path, help="Backup destination")
+
+    list_parser = subparsers.add_parser("list", help="List projects or snapshots")
+    list_parser.add_argument("--dest", required=True, type=Path)
+    list_parser.add_argument("--project", type=str, default=None)
+
+    show_parser = subparsers.add_parser("show", help="Show files in a project at a date")
+    show_parser.add_argument("--dest", required=True, type=Path)
+    show_parser.add_argument("--project", required=True)
+    show_parser.add_argument("--date", required=True, help="Date prefix, e.g. 2026-05-12")
+
+    restore_parser = subparsers.add_parser("restore", help="Restore a project or a single file at a date")
+    restore_parser.add_argument("--dest", required=True, type=Path)
+    restore_parser.add_argument("--project", required=True)
+    restore_parser.add_argument("--date", required=True)
+    restore_parser.add_argument("--file", default=None, help="Restore a single file")
+    restore_parser.add_argument("--out", required=True, type=Path, help="Where to restore to")
+
+    args = parser.parse_args()
+
+    if args.cmd == "backup":
+        do_backup(args.src, args.dest)
+        return
+
+    if args.cmd == "list":
+        do_list(args.dest, args.project)
+        return
+
+    if args.cmd == "show":
+        do_show(args.dest, args.project, args.date)
+        return
+
+    if args.cmd == "restore":
+        do_restore(args.dest, args.project, args.date, args.out, args.file)
+        return
+
+    parser.print_help()
+
+
+def _write_line(message: str) -> None:
+    sys.stdout.write("{}\n".format(message))
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+
+    return True
+
+
+def _load_ignore_rules(dest: Path) -> Tuple[Set[str], Set[str]]:
+    ignore_names = set(DEFAULT_IGNORE_NAMES)
+    ignore_extensions = set(DEFAULT_IGNORE_EXTENSIONS)
+
+    script_ignore_path = Path(__file__).resolve().with_name(IGNORE_FILE_NAME)
+    destination_ignore_path = dest / IGNORE_FILE_NAME
+
+    _apply_ignore_file(script_ignore_path, ignore_names, ignore_extensions)
+
+    if destination_ignore_path.resolve() != script_ignore_path.resolve():
+        _apply_ignore_file(destination_ignore_path, ignore_names, ignore_extensions)
+
+    return ignore_names, ignore_extensions
+
+
+def _apply_ignore_file(ignore_path: Path, ignore_names: Set[str], ignore_extensions: Set[str]) -> None:
+    if not ignore_path.is_file():
+        return
+
+    try:
+        with open(str(ignore_path), "r", encoding="utf-8") as ignore_file:
+            for raw_line in ignore_file:
+                pattern = raw_line.strip()
+
+                if not pattern:
+                    continue
+
+                if pattern.startswith("#"):
+                    continue
+
+                normalized_pattern = pattern.rstrip("/")
+
+                if not normalized_pattern:
+                    continue
+
+                if normalized_pattern.startswith("*."):
+                    extension = normalized_pattern[1:]
+                    ignore_extensions.add(extension)
+                    continue
+
+                ignore_names.add(normalized_pattern)
+    except OSError as error:
+        message = "Cannot read ignore file: {}".format(ignore_path)
+        raise _BackupReadError(message) from error
+
+
+def _build_backup_plan(
+    src: Path,
+    cur: sqlite3.Cursor,
+    ignore_rules: Tuple[Set[str], Set[str]],
+) -> _BackupPlan:
+    ignore_names = ignore_rules[0]
+    ignore_extensions = ignore_rules[1]
+    projects = sorted(
+        project_path for project_path in src.iterdir()
+        if project_path.is_dir() and not project_path.name.startswith(".")
+    )
+    file_states: List[_FileState] = []
+    new_blobs_by_sha: Dict[str, _NewBlob] = {}
+    files_added = 0
+    files_deleted = 0
+
+    for project_path in projects:
+        project = project_path.name
+        current = scan_project(project_path, ignore_names, ignore_extensions)
+        previous = _get_previous_project_state(cur, project)
+
+        for rel_path in sorted(current):
+            file_info = current[rel_path]
+            file_hash = file_info[0]
+            file_size = file_info[1]
+
+            if rel_path in previous and previous[rel_path] == file_hash:
+                continue
+
+            file_states.append(_FileState(project, rel_path, file_hash, file_size, 0))
+            files_added += 1
+
+            if _has_blob(cur, file_hash):
+                continue
+
+            if file_hash in new_blobs_by_sha:
+                continue
+
+            source_path = project_path / rel_path
+            zip_key = "{}/{}".format(project, rel_path)
+            new_blobs_by_sha[file_hash] = _NewBlob(file_hash, source_path, zip_key)
+
+        current_paths = set(current.keys())
+        previous_paths = set(previous.keys())
+        deleted_paths = previous_paths - current_paths
+
+        for rel_path in sorted(deleted_paths):
+            file_hash = previous[rel_path]
+            file_states.append(_FileState(project, rel_path, file_hash, 0, 1))
+            files_deleted += 1
+
+    new_blobs = list(new_blobs_by_sha.values())
+    return _BackupPlan(file_states, new_blobs, files_added, files_deleted)
+
+
+def _get_previous_project_state(cur: sqlite3.Cursor, project: str) -> Dict[str, str]:
+    rows = cur.execute("""
+        SELECT fs.rel_path, fs.sha256, fs.deleted
+        FROM file_states fs
+        WHERE fs.project = ?
+          AND fs.snapshot_id = (
+              SELECT MAX(fs2.snapshot_id)
+              FROM file_states fs2
+              WHERE fs2.project = fs.project
+                AND fs2.rel_path = fs.rel_path
+          )
+    """, (project,)).fetchall()
+    previous: Dict[str, str] = {}
+
+    for row in rows:
+        deleted = row[2]
+
+        if deleted:
             continue
-        zpath, zkey = blob_row
-        target = out / rp
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zpath, "r") as zf:
-            data = zf.read(zkey)
-        target.write_bytes(data)
-        restored += 1
 
-    print(f"Restored {restored} file(s) → {out}")
-    conn.close()
+        rel_path = row[0]
+        file_hash = row[1]
+        previous[rel_path] = file_hash
+
+    return previous
 
 
-# ── Internal helpers ─────────────────────────────────────────────────────────
+def _has_blob(cur: sqlite3.Cursor, file_hash: str) -> bool:
+    row = cur.execute(
+        "SELECT 1 FROM blobs WHERE sha256 = ?",
+        (file_hash,),
+    ).fetchone()
+    return row is not None
 
-def _resolve_snapshot(
-    cur: sqlite3.Cursor, project: str, date_str: str
-) -> Optional[int]:
-    """Find the latest snapshot id for `project` whose timestamp starts with `date_str` or is ≤ it."""
-    # If user passes just a date like 2026-05-12, match any snapshot that day
-    # otherwise treat as prefix / upper bound
+
+def _create_snapshot_paths(dest: Path) -> _SnapshotPaths:
+    base_name = datetime.now().strftime(SNAPSHOT_DATE_FORMAT)
+    snapshot_name = base_name
+    snapshot_dir = dest / SNAPSHOT_DIR_NAME / snapshot_name
+    suffix = 0
+
+    while snapshot_dir.exists():
+        suffix += 1
+        snapshot_name = "{}_{}".format(base_name, suffix)
+        snapshot_dir = dest / SNAPSHOT_DIR_NAME / snapshot_name
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = snapshot_dir / SNAPSHOT_ZIP_NAME
+    return _SnapshotPaths(snapshot_name, snapshot_dir, zip_path)
+
+
+def _write_new_blobs(new_blobs: List[_NewBlob], zip_path: Path) -> None:
+    with zipfile.ZipFile(
+        str(zip_path),
+        "w",
+        zipfile.ZIP_DEFLATED,
+        compresslevel=ZIP_COMPRESSION_LEVEL,
+    ) as zip_archive:
+        for new_blob in new_blobs:
+            written_hash = _write_file_to_zip(zip_archive, new_blob.source_path, new_blob.zip_key)
+
+            if written_hash != new_blob.sha256:
+                message = "File changed while backup was being written: {}".format(new_blob.source_path)
+                raise _BackupReadError(message)
+
+
+def _write_file_to_zip(
+    zip_archive: zipfile.ZipFile,
+    source_path: Path,
+    zip_key: str,
+    buf_size: int = HASH_BUFFER_SIZE,
+) -> str:
+    digest = hashlib.sha256()
+
+    try:
+        with open(str(source_path), "rb") as source_file:
+            with zip_archive.open(zip_key, "w") as target_file:
+                chunk = source_file.read(buf_size)
+
+                while chunk:
+                    digest.update(chunk)
+                    target_file.write(chunk)
+                    chunk = source_file.read(buf_size)
+    except OSError as error:
+        message = "Cannot write file into backup: {}".format(source_path)
+        raise _BackupReadError(message) from error
+
+    return digest.hexdigest()
+
+
+def _save_snapshot(cur: sqlite3.Cursor, snapshot_paths: _SnapshotPaths, backup_plan: _BackupPlan) -> None:
+    cur.execute(
+        "INSERT INTO snapshots(timestamp, zip_path, files_added, files_del) VALUES (?, ?, ?, ?)",
+        (
+            snapshot_paths.snapshot_name,
+            str(snapshot_paths.zip_path),
+            backup_plan.files_added,
+            backup_plan.files_deleted,
+        ),
+    )
+    snapshot_id = cur.lastrowid
+
+    for new_blob in backup_plan.new_blobs:
+        cur.execute(
+            "INSERT INTO blobs(sha256, zip_path, zip_key) VALUES (?, ?, ?)",
+            (new_blob.sha256, str(snapshot_paths.zip_path), new_blob.zip_key),
+        )
+
+    for file_state in backup_plan.file_states:
+        cur.execute(
+            "INSERT INTO file_states(snapshot_id, project, rel_path, sha256, size, deleted) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                snapshot_id,
+                file_state.project,
+                file_state.rel_path,
+                file_state.sha256,
+                file_state.size,
+                file_state.deleted,
+            ),
+        )
+
+
+def _remove_snapshot_dir(snapshot_dir: Path) -> None:
+    if not snapshot_dir.exists():
+        return
+
+    shutil.rmtree(str(snapshot_dir))
+
+
+def _resolve_snapshot(cur: sqlite3.Cursor, project: str, date_str: str) -> Optional[int]:
     row = cur.execute("""
         SELECT s.id FROM snapshots s
-        WHERE s.id IN (SELECT DISTINCT snapshot_id FROM file_states WHERE project=?)
+        WHERE s.id IN (SELECT DISTINCT snapshot_id FROM file_states WHERE project = ?)
           AND s.timestamp <= ? || '~'
         ORDER BY s.timestamp DESC LIMIT 1
     """, (project, date_str)).fetchone()
-    return row[0] if row else None
+
+    if row is None:
+        return None
+
+    return row[0]
 
 
-def _reconstruct_tree(
-    cur: sqlite3.Cursor, project: str, up_to_snap: int
-) -> dict[str, str]:
-    """Replay file_states up to `up_to_snap` and return {rel_path: sha256} of live files."""
+def _reconstruct_tree(cur: sqlite3.Cursor, project: str, up_to_snap: int) -> Dict[str, str]:
     rows = cur.execute("""
         SELECT rel_path, sha256, deleted
         FROM file_states
         WHERE project = ? AND snapshot_id <= ?
         ORDER BY snapshot_id ASC, id ASC
     """, (project, up_to_snap)).fetchall()
-    tree: dict[str, str] = {}
-    for rp, sha, deleted in rows:
+    tree: Dict[str, str] = {}
+
+    for row in rows:
+        rel_path = row[0]
+        file_hash = row[1]
+        deleted = row[2]
+
         if deleted:
-            tree.pop(rp, None)
-        else:
-            tree[rp] = sha
+            tree.pop(rel_path, None)
+            continue
+
+        tree[rel_path] = file_hash
+
     return tree
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    p = argparse.ArgumentParser(
-        prog="snapback",
-        description="Incremental project backups with per-file dedup into zip archives.",
-    )
-    sub = p.add_subparsers(dest="cmd")
-
-    # backup
-    bp = sub.add_parser("backup", help="Create a new snapshot")
-    bp.add_argument("--src", required=True, type=Path, help="Root directory with projects")
-    bp.add_argument("--dest", required=True, type=Path, help="Backup destination (external drive)")
-
-    # list
-    lp = sub.add_parser("list", help="List projects or snapshots")
-    lp.add_argument("--dest", required=True, type=Path)
-    lp.add_argument("--project", type=str, default=None)
-
-    # show
-    sp = sub.add_parser("show", help="Show files in a project at a date")
-    sp.add_argument("--dest", required=True, type=Path)
-    sp.add_argument("--project", required=True)
-    sp.add_argument("--date", required=True, help="Date prefix, e.g. 2026-05-12")
-
-    # restore
-    rp = sub.add_parser("restore", help="Restore a project (or a single file) at a date")
-    rp.add_argument("--dest", required=True, type=Path)
-    rp.add_argument("--project", required=True)
-    rp.add_argument("--date", required=True)
-    rp.add_argument("--file", default=None, help="Restore a single file (relative path)")
-    rp.add_argument("--out", required=True, type=Path, help="Where to restore to")
-
-    args = p.parse_args()
-
-    if args.cmd == "backup":
-        do_backup(args.src, args.dest)
-    elif args.cmd == "list":
-        do_list(args.dest, args.project)
-    elif args.cmd == "show":
-        do_show(args.dest, args.project, args.date)
-    elif args.cmd == "restore":
-        do_restore(args.dest, args.project, args.date, args.out, args.file)
-    else:
-        p.print_help()
-
-
 if __name__ == "__main__":
-    do_backup._pending = []  # type: ignore[attr-defined]
     main()
