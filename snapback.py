@@ -169,6 +169,9 @@ def scan_project(
             if should_ignore(rel_path, ignore_names, ignore_extensions):
                 continue
 
+            if file_path.is_symlink():
+                continue
+
             try:
                 file_hash = sha256_file(file_path)
                 file_size = file_path.stat().st_size
