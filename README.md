@@ -26,7 +26,8 @@ project directories on a local disk, external drive, or mounted volume.
 ## What It Does
 
 - Scans every top-level directory inside `--src` as a separate project.
-- Creates snapshots only when something changed.
+- Creates incremental snapshots only when something changed.
+- Creates self-contained full snapshots on demand.
 - Stores new file content in compressed zip archives.
 - Deduplicates file blobs by SHA-256, so identical content is stored once.
 - Tracks project state in a small SQLite database.
@@ -55,6 +56,12 @@ Back up all projects inside `~/Projects`:
 
 ```bash
 python3 snapback.py backup --src ~/Projects --dest /Volumes/Backup/snapback
+```
+
+Create a self-contained full snapshot using the same ignore rules:
+
+```bash
+python3 snapback.py backup --full --src ~/Projects --dest /Volumes/Backup/snapback
 ```
 
 List projects that have backups:
@@ -99,6 +106,17 @@ python3 snapback.py restore \
   --out ./restored/myapp
 ```
 
+Restore from the nearest full snapshot and only the incrementals created after it:
+
+```bash
+python3 snapback.py restore \
+  --project myapp \
+  --date 2026-05-12 \
+  --dest /Volumes/Backup/snapback \
+  --out ./restored/myapp \
+  --use-full
+```
+
 ## Storage Layout
 
 Snapback writes everything under the destination directory:
@@ -107,12 +125,17 @@ Snapback writes everything under the destination directory:
 /Volumes/Backup/snapback/
 ├── snapback.db
 └── snapshots/
-    └── 2026-05-12_21-44-08/
-        └── data.zip
+    ├── 2026-05-12_21-44-08/
+    │   └── data.zip
+    └── 2026-05-18_21-44-08/
+        └── full.zip
 ```
 
 The SQLite database stores snapshot metadata and file state. Zip files store file content. If the same file content
 appears again, Snapback links to the already stored blob instead of writing a duplicate.
+
+A `full.zip` contains every non-ignored source path and can be unpacked without older archives. It also starts a new
+deduplication chain, so `restore --use-full` never reads archives created before that full snapshot.
 
 ## Practical Workflow
 
@@ -127,6 +150,8 @@ file you actually want back.
 
 For macOS, a simple daily `launchd` job works well. On Linux, cron or a systemd timer is enough. Snapback has no
 background daemon and no runtime dependencies outside the Python standard library.
+
+Use the regular backup command daily and schedule `backup --full` weekly or monthly for an independent restore base.
 
 ## License
 
